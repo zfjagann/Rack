@@ -190,12 +190,7 @@ struct ProfilerWorker {
 			thread.join();
 	}
 
-	void run() {
-		while (running) {
-			DEBUG("sample");
-			std::this_thread::sleep_for(std::chrono::nanoseconds(100000000));
-		}
-	}
+	void run();
 };
 
 
@@ -223,13 +218,18 @@ struct Engine::Internal {
 	std::thread thread;
 	VIPMutex vipMutex;
 
+	// Workers
 	bool realTime = false;
 	int threadCount = 0;
 	std::vector<EngineWorker> workers;
 	HybridBarrier engineBarrier;
 	HybridBarrier workerBarrier;
 	std::atomic<int> workerModuleIndex;
+
+	// Profiler
 	ProfilerWorker profilerWorker;
+	std::vector<Module*> activeModules;
+	std::thread::native_handle_type engineThreadHandle;
 };
 
 
@@ -275,20 +275,9 @@ static void Engine_stepModules(Engine* that, int threadId) {
 		Module* module = internal->modules[i];
 		if (!module->bypass) {
 			// Step module
-			if (settings::cpuMeter) {
-				auto startTime = std::chrono::high_resolution_clock::now();
-
-				module->process(processCtx);
-
-				auto stopTime = std::chrono::high_resolution_clock::now();
-				float cpuTime = std::chrono::duration<float>(stopTime - startTime).count();
-				// Smooth CPU time
-				const float cpuTau = 2.f /* seconds */;
-				module->cpuTime += (cpuTime - module->cpuTime) * sampleTime / cpuTau;
-			}
-			else {
-				module->process(processCtx);
-			}
+			that->internal->activeModules[threadId] = module;
+			module->process(processCtx);
+			that->internal->activeModules[threadId] = NULL;
 		}
 
 		// Iterate ports to step plug lights
@@ -385,7 +374,7 @@ static void Engine_relaunchWorkers(Engine* that, int threadCount, bool realTime)
 
 	if (internal->threadCount > 0) {
 		// Stop profiler
-		// internal->profilerWorker.stop();
+		internal->profilerWorker.stop();
 
 		// Stop engine workers
 		for (EngineWorker& worker : internal->workers) {
@@ -398,6 +387,8 @@ static void Engine_relaunchWorkers(Engine* that, int threadCount, bool realTime)
 			worker.join();
 		}
 		internal->workers.resize(0);
+
+		internal->activeModules.resize(0);
 	}
 
 	// Configure engine
@@ -413,6 +404,7 @@ static void Engine_relaunchWorkers(Engine* that, int threadCount, bool realTime)
 
 	if (threadCount > 0) {
 		// Create and start engine workers
+		internal->activeModules.resize(threadCount);
 		internal->workers.resize(threadCount - 1);
 		for (int id = 1; id < threadCount; id++) {
 			EngineWorker& worker = internal->workers[id - 1];
@@ -422,7 +414,8 @@ static void Engine_relaunchWorkers(Engine* that, int threadCount, bool realTime)
 		}
 
 		// Start profiler
-		// internal->profilerWorker.start();
+		internal->profilerWorker.engine = that;
+		internal->profilerWorker.start();
 	}
 }
 
@@ -470,6 +463,10 @@ static void Engine_run(Engine* that) {
 			// Step modules
 			for (int i = 0; i < mutexSteps; i++) {
 				Engine_step(that);
+			}
+
+			for (Module* module : internal->modules) {
+				module->cpuTime *= 0.999999f;
 			}
 		}
 
@@ -869,6 +866,21 @@ void EngineWorker::run() {
 			return;
 		Engine_stepModules(engine, id);
 		engine->internal->workerBarrier.wait();
+	}
+}
+
+
+void ProfilerWorker::run() {
+	while (running) {
+		for (int id = 0; id < engine->internal->threadCount; id++) {
+			Module* module = engine->internal->activeModules[id];
+			if (!module)
+				continue;
+
+			std::thread& thread = (id == 0) ? engine->internal->thread : engine->internal->workers[id - 1].thread;
+			module->cpuTime += 1e-10f;
+		}
+		std::this_thread::sleep_for(std::chrono::nanoseconds(10000));
 	}
 }
 
